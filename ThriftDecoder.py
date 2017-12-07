@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 from burp import IBurpExtender
 from burp import IMessageEditorTabFactory
 from burp import IMessageEditorTab
@@ -7,8 +7,9 @@ from burp import IContextMenuFactory, IHttpListener
 # Java imports
 from javax.swing import JMenuItem
 from java.util import ArrayList
+from jarray import array
 
-import traceback, json
+import traceback, json, re
 
 from thrift_tools.thrift_message import ThriftMessage
 from ThriftEncoder import ThriftEncoder
@@ -23,7 +24,7 @@ menuItems = {
 _forceThrift = False
 DEBUG = True
 
-def format_msg(msg, indent=4, tjson=True):
+def format_msg(msg, indent=4, tjson=True, intruder=False):
 	if tjson:
 		outputstr = json.dumps(msg.as_dict, indent=indent, ensure_ascii=False) + '\n'
 	else:
@@ -32,13 +33,15 @@ def format_msg(msg, indent=4, tjson=True):
 		fields_line = '%sfields: %s\n' % (indents, msg.args)
 		outputstr = 'method: %s, type: %s, seqid: %d,\n%s%s' % (
 			msg.method, msg.type, msg.seqid, header_line, fields_line)
-
+	if not intruder:
+		outputstr = outputstr.replace('§', '')
 	return outputstr
 
 class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IContextMenuFactory, IHttpListener):
 	def registerExtenderCallbacks(self, callbacks):
 		self._callbacks = callbacks
 		self._helpers = callbacks.getHelpers()
+		self._messages = None
 
 		callbacks.setExtensionName('Thrift Decoder')
 		callbacks.registerMessageEditorTabFactory(self)
@@ -55,10 +58,12 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IContextMenuFactory,
 			body = responseStr[responseInfo.getBodyOffset():]
 			headers = responseInfo.getHeaders()
 			for (i, header) in enumerate(headers):
-				if header.lower() == 'content-type: application/x-thrift':
-					break
-			else:
-				return
+				if header.lower().startswith("content-type:"):
+					content_type = header.split(":")[1].lower()
+					if content_type.find("application/x-thrift") > 0 or content_type.find("text/x-thrift") > 0:
+						break
+					else:
+						return
 
 			msg, msglen = ThriftMessage.read(body, read_values=True)
 			response = self._helpers.buildHttpMessage(headers, 
@@ -100,16 +105,72 @@ class BurpExtender(IBurpExtender, IMessageEditorTabFactory, IContextMenuFactory,
 	def createNewInstance(self, controller, editable): 
 		return thriftDecoderTab(self, controller, editable)
 
-	def createMenuItems(self, IContextMenuInvocation):
+	def createMenuItems(self, invocation):
 		global _forceThrift
+		self._messages = invocation.getSelectedMessages();
 		menuItemList = ArrayList()
 		menuItemList.add(JMenuItem(menuItems[_forceThrift], actionPerformed = self.onClick))
+		menuItemList.add(JMenuItem("Send Thrift to Intruder", actionPerformed = self.sendIntruder))
+		menuItemList.add(JMenuItem("Start Thrift Active Scan", actionPerformed = self.startScan))
 
 		return menuItemList
 
 	def onClick(self, event):
 		global _forceThrift
 		_forceThrift = not _forceThrift
+
+	def sendIntruder(self, event):
+		self.sendIntruderStartScan()
+
+	def sendIntruderStartScan(self, scan=False):
+		for item in self._messages:
+			try:
+				request = item.getRequest()
+				requestInfo = self._helpers.analyzeRequest(item)
+				headers = requestInfo.getHeaders()
+				msgBody = self._helpers.bytesToString(request[requestInfo.getBodyOffset():])
+
+				for (i, header) in enumerate(headers):
+					if header.lower().startswith("content-type:"):
+						content_type = header.split(":")[1].lower()
+						if content_type.find("application/x-thrift") > 0 or content_type.find("text/x-thrift") > 0:
+							headers[i] = "Content-Type: application/x-thrift-decoded"
+							break
+						else:
+							return
+				msg, msglen = ThriftMessage.read(msgBody, read_values=True)
+				int_msg = format_msg(msg, intruder=True)
+				pos = [m.start() for m in re.finditer('§', int_msg)]
+
+				# create body now to get the offset
+				int_msg = int_msg.replace('§', '')
+				response = self._helpers.buildHttpMessage(headers, 
+					self._helpers.stringToBytes(int_msg))
+				requestInfo = self._helpers.analyzeRequest(response)
+				offset = requestInfo.getBodyOffset()
+				# add offset to each position 
+				pos = [offset + p for p in pos]
+
+				payloadPositionOffsets = ArrayList()
+				for i in range(0, len(pos), 2):
+					payloadPositionOffsets.add(array((pos[i] - (i*2), pos[i+1] - ((i+1)*2)),'i'))
+				
+				httpService = item.getHttpService()
+				secure = httpService.getProtocol() == "https"
+				if scan:
+					self._callbacks.doActiveScan(httpService.getHost(), 
+						httpService.getPort(), secure, response, payloadPositionOffsets)
+				else:
+					self._callbacks.sendToIntruder(httpService.getHost(), 
+						httpService.getPort(), secure, response, payloadPositionOffsets)
+
+			except Exception as ex:
+				print "problem sending item to intruder"
+				if DEBUG:
+					print ex, traceback.format_exc()
+	
+	def startScan(self, event):
+		self.sendIntruderStartScan(scan=True)
 		
 class thriftDecoderTab(IMessageEditorTab):
 	def __init__(self, extender, controller, editable):

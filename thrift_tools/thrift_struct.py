@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from thrift.Thrift import TType
 
 
@@ -172,7 +173,7 @@ class ThriftStruct(object):
                 proto.skip(ftype)
         elif ftype == TType.STRING:
             if read_values:
-                value = proto.readString()
+                value = '§%s§' % proto.readString()
             else:
                 proto.skip(ftype)
         elif ftype == TType.LIST:
